@@ -2,7 +2,7 @@
  * newpatch.h - function declarations and defines for newpatch.c
  *
  * Copyright 2020 dayt0n
- * Modified: added dynamic scoring selection, rootfs, panic, bootx, serial.
+ * Modified: fixed LOG/WARN macros.
  */
 
 #pragma once
@@ -26,8 +26,9 @@ struct iboot64_img {
     uint64_t base;
 } __attribute__((packed));
 
-#define LOG(fmt, ...) printf("[+] " fmt, ##__VA_ARGS__);
-#define WARN(fmt, ...) printf("[!] " fmt, ##__VA_ARGS__);
+// Sửa macro để tránh lỗi if-else
+#define LOG(fmt, ...) do { printf("[+] " fmt, ##__VA_ARGS__); } while (0)
+#define WARN(fmt, ...) do { printf("[!] " fmt, ##__VA_ARGS__); } while (0)
 
 #define GET_IBOOT64_ADDR(iboot_in, x) (x - (uintptr_t) iboot_in->buf) + iboot_in->base
 #define GET_IBOOT_FILE_OFFSET(iboot_in, x) (x - (uintptr_t) iboot_in->buf)
@@ -53,5 +54,8 @@ int install_usb_backdoor(struct iboot64_img* iboot_in);
 int patch_image_type(struct iboot64_img* iboot_in);
 int patch_rootfs_bypass(struct iboot64_img* iboot_in);
 int patch_panic_bypass(struct iboot64_img* iboot_in);
+int patch_bootx_precondition(struct iboot64_img* iboot_in);
+int patch_serial_labels(struct iboot64_img* iboot_in);
+
 int patch_bootx_precondition(struct iboot64_img* iboot_in);
 int patch_serial_labels(struct iboot64_img* iboot_in);
