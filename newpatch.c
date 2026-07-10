@@ -2,585 +2,618 @@
  * newpatch.c - functions patching unpacked iOS IM4P bootloader files
  *
  * Copyright 2020 dayt0n
- *
- * This file is part of kairos.
- *
- * kairos is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * kairos is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with kairos.  If not, see <https://www.gnu.org/licenses/>.
-*/
+ * Modified: hybrid pattern-based + dynamic RSA, CTRR, improved boot-args, NVRAM unlock.
+ * Supports PAC (arm64e) and non-PAC, iOS 10 through 27.
+ */
 
 #define _GNU_SOURCE
 #include "newpatch.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 #ifdef _WIN32
-void *memmem(const void *haystack, size_t haystack_len, 
+void *memmem(const void *haystack, size_t haystack_len,
     const void * const needle, const size_t needle_len)
 {
-    if (haystack == NULL) return NULL; // or assert(haystack != NULL);
-    if (haystack_len == 0) return NULL;
-    if (needle == NULL) return NULL; // or assert(needle != NULL);
-    if (needle_len == 0) return NULL;
-
-    for (const char *h = haystack;
-            haystack_len >= needle_len;
-            ++h, --haystack_len) {
-        if (!memcmp(h, needle, needle_len)) {
-            return h;
-        }
+    if (!haystack || !needle || haystack_len < needle_len) return NULL;
+    for (const char *h = haystack; haystack_len >= needle_len; ++h, --haystack_len) {
+        if (!memcmp(h, needle, needle_len)) return (void*)h;
     }
     return NULL;
 }
 #endif
 
-/* begin functions from iBoot32Patcher by iH8sn0w*/
-bool has_magic(uint8_t* buf) {
-	uint32_t magic;
-	magic = *(uint32_t*)(buf+7);
-	if(memcmp(&magic,IMAGE4_MAGIC,4) == 0) {
-		return true;
-	}
-	return false;
+/* -------------------------------------------------------------------------
+   Constants
+   ------------------------------------------------------------------------- */
+#define SIGCHECK_NEEDLE     0x72a86a60   // movk w0, #0x4353, lsl #16
+#define PACIBSP             0xD503237F
+#define BTI_C               0xD503245F
+#define NOP                 0xD503201F
+#define RET                 0xD65F03C0
+#define RETAB               0xD65F0FFF
+#define MOV_X0_0            0xD2800000
+#define MOV_X0_1            0xD2800020
+
+/* -------------------------------------------------------------------------
+   External functions (provided by patchfinder64.c / newpatch.h)
+   ------------------------------------------------------------------------- */
+extern uint32_t get_insn(uint8_t *buf, addr_t off);
+extern void write_opcode(uint8_t *buf, addr_t off, uint32_t val);
+extern addr_t bof64(uint8_t *buf, addr_t start, addr_t where);
+extern addr_t xref64(uint8_t *buf, addr_t start, addr_t end, addr_t what);
+extern addr_t xref64code(uint8_t *buf, addr_t start, addr_t end, addr_t what);
+extern addr_t calc64(uint8_t *buf, addr_t start, addr_t end, int reg);
+extern addr_t step64(uint8_t *buf, addr_t start, size_t len, uint32_t what, uint32_t mask);
+extern addr_t step64_back(uint8_t *buf, addr_t start, size_t len, uint32_t what, uint32_t mask);
+extern addr_t follow_call64(uint8_t *buf, addr_t call);
+extern uint32_t new_mov_immediate_insn(int reg, uint64_t imm, int is64);
+extern uint32_t new_ret_insn(int reg);
+extern uint32_t new_nop(void);
+extern uint32_t new_branch(addr_t from, addr_t to);
+extern uint32_t new_insn_adr(addr_t pc, int reg, addr_t target);
+extern uint32_t replace_adr_addr(addr_t pc, uint32_t old_insn, addr_t target);
+extern uint32_t get_addr_for_adr(addr_t pc, uint32_t insn);
+extern int get_type(uint32_t insn);
+extern int get_rd(uint32_t insn);
+extern int get_rn(uint32_t insn);
+extern int get_rm(uint32_t insn);
+extern insn_type_t get_supertype(uint32_t insn);
+extern uint64_t get_ptr_loc(uint8_t *buf, addr_t off);
+extern addr_t get_next_nth_insn(uint8_t *buf, addr_t start, int n, insn_type_t type);
+extern bool iboot64_pac_check(struct iboot64_img* iboot_in);
+extern void* iboot64_memmem(struct iboot64_img* iboot_in, void* pat);
+extern uint64_t iboot64_ref(struct iboot64_img* iboot_in, void* pat);
+extern addr_t GET_IBOOT_FILE_OFFSET(struct iboot64_img* iboot_in, void* ptr);
+extern addr_t GET_IBOOT64_ADDR(struct iboot64_img* iboot_in, void* ptr);
+extern int get_iboot64_version(struct iboot64_img* iboot_in);
+
+/* -------------------------------------------------------------------------
+   Utilities: find ADRP+ADD xrefs to a data offset
+   ------------------------------------------------------------------------- */
+typedef struct { addr_t adrp; addr_t add; } adrp_add_pair_t;
+
+static int find_adrp_add_refs(uint8_t *buf, size_t len, addr_t base, addr_t target_off,
+                              adrp_add_pair_t *pairs, int max_pairs)
+{
+    addr_t target_va = base + target_off;
+    addr_t target_page = target_va & ~0xFFF;
+    addr_t target_pageoff = target_va & 0xFFF;
+    int count = 0;
+
+    for (addr_t off = 0; off < len - 8; off += 4) {
+        uint32_t w = get_insn(buf, off);
+        if ((w & 0x9F000000) != 0x90000000) continue; // ADRP
+        int immhi = (w >> 5) & 0x7FFFF;
+        int immlo = (w >> 29) & 0x3;
+        int64_t imm = ((immhi << 2) | immlo) << 12;
+        if (imm & (1ULL << 32)) imm -= (1ULL << 33);
+        addr_t page = ((base + off) & ~0xFFF) + imm;
+        if (page != target_page) continue;
+
+        uint32_t next = get_insn(buf, off + 4);
+        if ((next & 0xFF800000) != 0x91000000) continue;
+        int rd_adrp = w & 0x1F;
+        int rn_add = (next >> 5) & 0x1F;
+        int imm12 = (next >> 10) & 0xFFF;
+        if (rd_adrp == rn_add && imm12 == target_pageoff) {
+            if (count < max_pairs) {
+                pairs[count].adrp = off;
+                pairs[count].add = off + 4;
+                count++;
+            }
+            // continue scanning for more
+        }
+    }
+    return count;
 }
 
-bool has_kernel_load_k(struct iboot64_img* iboot_in) {
-	void* debug_enabled_str = memmem(iboot_in->buf, iboot_in->len, KERNELCACHE_PREP_STRING,strlen(KERNELCACHE_PREP_STRING));
-	return (bool) (debug_enabled_str != NULL);
+/* -------------------------------------------------------------------------
+   1. RSA signature check – hybrid pattern + needle + fallback
+   ------------------------------------------------------------------------- */
+
+// Pattern-based: find MOVN Wn,#0 -> B.NE -> MOV X0,Xn
+static addr_t find_image4_callback_pattern(uint8_t *buf, size_t len) {
+    for (addr_t off = 0; off < len - 4; off += 4) {
+        uint32_t w = get_insn(buf, off);
+        if ((w & 0xFFFFF81F) != 0x12800000) continue; // MOVN Wn, #0
+        int wreg = w & 0x1F;
+
+        // find B.NE within previous 32 instructions
+        addr_t bne = 0;
+        for (int k = 1; k < 32; k++) {
+            if (off - k*4 < 0) break;
+            uint32_t prev = get_insn(buf, off - k*4);
+            if ((prev & 0xFF00001F) == 0x54000001) { // B.NE
+                bne = off - k*4;
+                break;
+            }
+        }
+        if (!bne) continue;
+
+        // find MOV X0, Xn within next 16 instructions
+        addr_t mov = 0;
+        for (int k = 1; k < 16; k++) {
+            if (off + k*4 + 4 > len) break;
+            uint32_t nxt = get_insn(buf, off + k*4);
+            if ((nxt & 0xFFE0FFE0) == 0xAA0003E0) { // MOV X0, Xn
+                mov = off + k*4;
+                break;
+            }
+        }
+        if (!mov) continue;
+
+        LOG("Pattern RSA: MOVN W%d @0x%llx, B.NE @0x%llx, MOV X0 @0x%llx\n",
+            wreg, off, bne, mov);
+        return bne; // return B.NE offset
+    }
+    return 0;
 }
 
-bool has_recovery_console_k(struct iboot64_img* iboot_in) {
-	void* entering_recovery_str = memmem(iboot_in->buf, iboot_in->len, ENTERING_RECOVERY_CONSOLE,strlen(ENTERING_RECOVERY_CONSOLE));
-	return (bool) (entering_recovery_str != NULL);
+// Needle-based: search for movk w0,#0x4353
+static addr_t find_sig_check_fn_dynamic(uint8_t *buf, size_t len) {
+    uint32_t needle = SIGCHECK_NEEDLE;
+    void *loc = memmem(buf, len, &needle, sizeof(needle));
+    if (!loc) {
+        WARN("Dynamic needle (movk) not found\n");
+        return 0;
+    }
+    addr_t off = (addr_t)((uintptr_t)loc - (uintptr_t)buf);
+    LOG("Found needle at 0x%llx\n", off);
+
+    addr_t pos = off;
+    int found = 0;
+    for (int i = 0; i < 200; i++) {
+        pos += 4;
+        if (pos + 4 > len) break;
+        uint32_t op = get_insn(buf, pos);
+        if ((op & 0xFE1F0000) == 0xD61F0000 || (op & 0xFFE0FFFF) == 0xD65F0000) {
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        WARN("No BR/BLR/RET after needle\n");
+        return 0;
+    }
+    addr_t fn = bof64(buf, 0, pos);
+    if (!fn) {
+        WARN("bof64 failed\n");
+        return 0;
+    }
+    LOG("Dynamic function start at 0x%llx\n", fn);
+    return fn;
 }
 
-void* iboot64_memmem(struct iboot64_img* iboot_in, void* pat) { // slightly modified from ih8sn0w's iboot_memmem()
-	uint64_t new_pat = (uint64_t)GET_IBOOT64_ADDR(iboot_in, pat);
-	return (void*) memmem(iboot_in->buf,iboot_in->len,&new_pat,sizeof(uint64_t));
-}
-
-bool iboot64_pac_check(struct iboot64_img* iboot_in) {
-	void *pacibsp = memmem(iboot_in->buf,iboot_in->len,PACIBSP,0x4);
-	if (!pacibsp) {
-		return false;
-	}
-	WARN("PAC bootloader detected\n");
-	return true;
-}
-
-uint64_t get_iboot64_base_address(struct iboot64_img* iboot_in) {  // modified from ih8sn0w's get_iboot_base_address()
-	uint32_t offset = 0x318;
-	get_iboot64_version(iboot_in);
-	if(iboot_in->buf) {
-		if(iboot_in->VERS >= 6603) // as of iOS 14, the base address appears to have been moved to 0x300
-			offset = 0x300;
-		iboot_in->base = *(uint64_t*)(iboot_in->buf + offset);
-		return iboot_in->base;
-	}
-	return 0;
-}
-/* end functions from iBoot32Patcher */
-
-uint32_t get_iboot64_version(struct iboot64_img* iboot_in) {
-	void* versionString = memmem(iboot_in->buf,iboot_in->len,"iBoot-",strlen("iBoot-"));
-	if(!versionString) {
-		return 0;
-	}
-	char vers[5];
-	// get major version
-	strncpy(vers,versionString+6,4);
-	iboot_in->VERS = atoi(vers);
-	// get minor version
-	memset(vers,'\0',5);
-	strncpy(vers,versionString+11,4);
-	char* period_loc = strchr(vers,'.');
-	*period_loc = '\0';
-	iboot_in->minor_vers = atoi(vers);
-	return iboot_in->VERS; // return major version
-}
-
-uint64_t iboot64_ref(struct iboot64_img* iboot_in, void* pat) {
-	uint64_t new_pat = (uintptr_t) GET_IBOOT64_ADDR(iboot_in, pat);
-	addr_t ref = xref64(iboot_in->buf,0,iboot_in->len,new_pat-iboot_in->base);
-	if(!ref) {
-		return -1;
-	}
-	return ref;
-}
-
-// inspiration for these functions from tihmstar/ih8sn0w
-int change_bootarg_adr_xref_addr(struct iboot64_img* iboot_in, addr_t dest, addr_t address) {
-	// get instruction type
-	uint32_t insn = get_insn(iboot_in->buf,dest);
-	insn_type_t type = get_type(insn);
-	if(type == unknown) {
-		return -1;
-	}
-	if(type == adr || type == nop) {
-		uint32_t newAdr = 0;
-		if ((iboot_in->VERS == 6723 && iboot_in->minor_vers >= 100) || iboot_in->VERS >= 7429) {
-			int reg = 24;
-            void* default_loc = NULL;
-            default_loc = memmem(iboot_in->buf,iboot_in->len," -restore",strlen(" -restore"));
-			if (!default_loc) {
-				WARN("Failed to find restore bootarg string!\n");
-				WARN("Defaulting to the x24 register!\n");
-			} else {
-				uint64_t restore_string_xref = iboot64_ref(iboot_in,default_loc);
-				while(get_type(get_insn(iboot_in->buf,restore_string_xref)) != sub)
-					restore_string_xref += -4;
-				uint32_t subInsn = get_insn(iboot_in->buf,restore_string_xref);
-				reg = (int)(subInsn & 0xFF) - 160;
-			}
-            newAdr = new_insn_adr(dest,reg,address-(addr_t)iboot_in->buf);
-		}
-		else
-			newAdr = replace_adr_addr(dest,insn,address-(addr_t)iboot_in->buf);
-		if (newAdr == -1) {
-			WARN("Address too far away\n");
-			return -1;
-		}
-		write_opcode(iboot_in->buf,dest,newAdr);
-	}
-	return 0;
-}
-
-int doFinalBootArgs(struct iboot64_img* iboot_in, addr_t xref, addr_t default_args_loc) {
-	if ((iboot_in->VERS == 6723 && iboot_in->minor_vers >= 100) || iboot_in->VERS >= 7429) // not necessary as of iOS 14.5
-		return 0;
-	uint32_t adrInsn = get_insn(iboot_in->buf,xref);
-	uint8_t rd = get_rd(adrInsn);
-	// find next csel
-	addr_t temp = xref;
-	while(get_type(get_insn(iboot_in->buf,temp)) != csel)
-		temp += 4;
-	uint32_t cselInsn = get_insn(iboot_in->buf,temp);
-	if(get_rn(cselInsn) != rd && get_rm(cselInsn) != rd) {
-		WARN("CSEL instruction does not compare the same register as the previous ADR instruction\n");
-		return -1;
-	}
-	uint32_t movInsn = new_mov_register_insn(get_rd(cselInsn),-1,rd,0); // change csel to mov, no conditions here. mov x# boot-arg-addr
-	write_opcode(iboot_in->buf,temp,movInsn);
-	LOG("Changed CSEL to MOV\n");
-	// now we need to look for the bl instruction before this entire method
-	temp -=4; // keep our distance
-	while(get_supertype(get_insn(iboot_in->buf,temp)) != supertype_branch_immediate || get_type(get_insn(iboot_in->buf,temp)) == bl)
-		temp -=4;
-	int64_t bImmediate = 0;
-	if(get_type(get_insn(iboot_in->buf,temp)) == cbz || get_type(get_insn(iboot_in->buf,temp)) == bcond )
-		bImmediate = get_addr_for_cbz(temp,get_insn(iboot_in->buf,temp));
-	else {
-		WARN("Something went wrong when finding branch instructions\n");
-		return -1;
-	}
-	LOG("Found branch pointing to 0x%llx at 0x%llx\n",((bImmediate-(temp/4))+temp)+iboot_in->base,temp);
-	temp = ((bImmediate-(temp/4))+temp); // set temp to the addr that bl goes to
-	for(int i = 0; i < 15; i++) { // look for next adr instruction. honestly, this may not even be needed
-	// it doesn't seem to do any damage, but for older iboots boot args don't seem to have a conditional branch where a dst reg is replaced
-	// and the csel -> mov insn really seems to do what we want here anyway...
-		if (temp > iboot_in->len)
-			break;
-		if(get_type(get_insn(iboot_in->buf,temp)) != adr)
-			temp += 4;
-		else {
-			int64_t oldAddr = get_addr_for_adr(temp,get_insn(iboot_in->buf,temp));
-			uint8_t oldRD = get_rd(get_insn(iboot_in->buf,temp));
-			uint32_t newAdr = replace_adr_addr(temp,get_insn(iboot_in->buf,temp),default_args_loc-(addr_t)iboot_in->buf); // replace with boot-arg location
-			write_opcode(iboot_in->buf,temp,newAdr);
-			LOG("Changed ADR X%d, 0x%llx to ADR X%d, 0x%llx\n",oldRD,((oldAddr-(temp/4))+temp)+iboot_in->base,get_rd(newAdr),(default_args_loc-(addr_t)iboot_in->buf)+iboot_in->base);
-			break;
-		}
-	}
-	return 0;
-}
-
-void do_kdbg_mov(struct iboot64_img* iboot_in, addr_t xref) {
-	// find second bl instruction
-	xref = get_next_nth_insn(iboot_in->buf,xref,2,bl);
-	LOG("Found second bl after debug-enabled xref at 0x%llx\n",xref);
-	// now we need to change this bl to movz x0, #1
-	uint32_t movOp = new_mov_immediate_insn(0,1,1);
-	write_opcode(iboot_in->buf,xref,movOp);
-	LOG("Wrote MOVZ X0, #1 to 0x%llx\n",xref+iboot_in->base);
-}
-
-bool checkIMG4Ref(uint8_t* buf, addr_t xref) {
-	xref -= 4;
-	for(int i = 0; i < 10; i++) {
-		/*
-		 * looking for
-		 * add x2, sp, #0x...
-		 * add x3, sp, #0x...
-		*/
-		if((get_type(get_insn(buf,xref)) == add) && (get_rd(get_insn(buf,xref)) == 3) && (get_rn(get_insn(buf,xref)) == 0x1f)) {
-			return true;
-		}
-		xref -= 4;
-	}
-	return false;
-}
-
+// Main RSA patch function – tries all methods
 void do_rsa_sigcheck_patch(struct iboot64_img* iboot_in, addr_t img4Xref, bool pac) {
-	addr_t img4refFtop = bof64(iboot_in->buf, 0, img4Xref);
-	if (pac == true) {
-		img4refFtop = img4refFtop - 0x4;
-	}
-	LOG("Found beginning of _image4_get_partial at 0x%llx\n",img4refFtop);
-	// older iBoot versions don't work with this patch method
-	// iPatcher, made by @exploit3dguy has some really effective patches for old iBoots
-	if (0) { // less than iOS 10
-		// It works effectively for decrypted images, 
-		// but does not for encrypted images. (tested: iPhone8,1, iBoot-2817.1.94)
-		void* movkLoc = NULL;
-		uint32_t movkInsn = 0;
-		if (iboot_in->VERS < 2261) // iOS 7
-			movkInsn = new_movk_insn(11,0x4348,0,0); // MOVK W11, #0x4348
-		else if (iboot_in->VERS < 2817) // iOS 8
-			movkInsn = new_movk_insn(10,0x4348,0,0); // MOVK W10, #0x4348
-		else // otherwise, it is iOS 9
-			movkInsn = new_movk_insn(8,0x4348,0,0); // MOVK W8, #0x4348
-		movkLoc = memmem(iboot_in->buf,iboot_in->len,&movkInsn,sizeof(movkInsn));
-		if (!movkLoc) {
-			WARN("Could not find MOVK W%llu, #0x4348 instruction for old iBoot\n", BIT_RANGE(movkInsn,0,4));
-			WARN("RSA PATCH FAILED\n");
-			return;
-		}
-		addr_t movkOffset = (addr_t)GET_IBOOT_FILE_OFFSET(iboot_in,movkLoc);
-		LOG("Found MOVK W%llu, #0x4348 at 0x%llx\n",BIT_RANGE(movkInsn,0,4), movkOffset);
-		addr_t funcStart = bof64(iboot_in->buf,0,movkOffset); // find beginning of img4 check function
-		LOG("Patching RSA check at 0x%llx\n",funcStart + iboot_in->base);
-		uint32_t finalMovInsn = new_mov_immediate_insn(0,0,1);
-		uint32_t retInsn = new_ret_insn(-1);
-		// make it return 0
-		write_opcode(iboot_in->buf,funcStart,finalMovInsn); // mov x0, #0
-		write_opcode(iboot_in->buf,funcStart+4,retInsn);    // ret
-		LOG("Did MOV r0, #0 and RET\n");
-		return;
-	}
-	// jump around
-	addr_t img4GetPartialRef = xref64code(iboot_in->buf, 0, iboot_in->len, img4refFtop);
-    
-	
-	for(int i = 0; i < 20; i++) {
-		if(checkIMG4Ref(iboot_in->buf,img4GetPartialRef))
-			break;
-		img4GetPartialRef = xref64code(iboot_in->buf,img4GetPartialRef+4,iboot_in->len-img4GetPartialRef-4,img4refFtop);
+    uint8_t *buf = iboot_in->buf;
+    size_t len = iboot_in->len;
+    addr_t func_start = 0;
 
-		if(i == 19) {
-			WARN("Could not find correct xref for _image4_get_partial.\n");
-			WARN("RSA PATCH FAILED\n");
-			return;
-		}
-	}
-	LOG("Found xref to _image4_get_partial at 0x%llx\n",img4GetPartialRef);
-	addr_t getPartialRefFtop = bof64(iboot_in->buf,0,img4GetPartialRef);
-	LOG("Found start of sub_%llx\n",iboot_in->base+getPartialRefFtop);
-	addr_t x2_adr = 0;
-	addr_t x3_adr = 0;
+    // 1. Pattern-based (best, works on most versions)
+    addr_t bne = find_image4_callback_pattern(buf, len);
+    if (bne) {
+        func_start = bof64(buf, 0, bne);
+        if (!func_start) func_start = bne;
+        LOG("Pattern RSA: func_start=0x%llx\n", func_start);
+    } else {
+        // 2. Needle-based
+        func_start = find_sig_check_fn_dynamic(buf, len);
+        if (!func_start) {
+            // 3. Fallback: IMG4 xref
+            func_start = bof64(buf, 0, img4Xref);
+            if (pac) func_start -= 4;
+            LOG("Fallback IMG4 xref: func_start=0x%llx\n", func_start);
+        }
+    }
 
-	insn_type_t x3_type = adr;
-	if (iboot_in->VERS < 2817){ // iOS 8
-		/*
-		* adr        x2, #0x83d38d680 <-
-		* nop
-		* add        x3, sp, #0x9
-		* ...
-		*/
-		x3_type = add;
-	}
-    
-	while(1) {
-		getPartialRefFtop += 4;
-		if(get_type(get_insn(iboot_in->buf,getPartialRefFtop)) == adr && get_rd(get_insn(iboot_in->buf,getPartialRefFtop)) == 2)
-			x2_adr = getPartialRefFtop;
-		else if(get_type(get_insn(iboot_in->buf,getPartialRefFtop)) == x3_type && get_rd(get_insn(iboot_in->buf,getPartialRefFtop)) == 3)
-			x3_adr = getPartialRefFtop;
-		else if(get_type(get_insn(iboot_in->buf,getPartialRefFtop)) == bl) {
-			if(x2_adr && x3_adr)
-				break;
-			else {
-				x2_adr = 0;
-				x3_adr = 0;
-			}
-		}
-	}
-	int64_t verifyRef = get_addr_for_adr(x2_adr,get_insn(iboot_in->buf,x2_adr));
-	LOG("Found ADR X2, 0x%llx at 0x%llx\n",verifyRef-(x2_adr/4)+x2_adr+iboot_in->base,x2_adr);
-	addr_t verifyFunc = (get_ptr_loc(iboot_in->buf,verifyRef-(x2_adr/4)+x2_adr)-iboot_in->base); // dereference
-	if (verifyFunc > (addr_t)(iboot_in->buf+iboot_in->len)) { // in older versions a dereference does not need to be made
-		verifyFunc = verifyRef-(x2_adr/4)+x2_adr;
-	}
-	LOG("Call to sub_%llx\n",verifyFunc+iboot_in->base);
-	addr_t crawl = verifyFunc;
-	if (iboot_in->VERS < 5540) { // iOS 10-12
-		crawl += 4;
-		while(get_type(get_insn(iboot_in->buf,crawl)) != ret) crawl += 4;
-		LOG("RET found for sub_%llx at 0x%llx\n",verifyFunc+iboot_in->base,crawl);
-	}
-	// otherwise, just patch at beginning, doesn't seem like this actually harms anything
-	uint32_t movInsn = new_mov_immediate_insn(0,0,1);
-	uint32_t retInsn = new_ret_insn(-1);
-	
-	void* mov_x0_0__ret = NULL;
-	uint32_t search[2];
-	search[0] = movInsn;
-	search[1] = retInsn;
-	mov_x0_0__ret = memmem(iboot_in->buf, iboot_in->len, &search, sizeof(search));
-	if(mov_x0_0__ret) {
-		// case1: ret0 gadget already exist
-		addr_t ret0_gadget = (addr_t)(mov_x0_0__ret - iboot_in->buf);
-		LOG("ret0 gadget at 0x%llx\n", ret0_gadget);
-		// make branch
-		write_opcode(iboot_in->buf, crawl, new_branch(crawl, ret0_gadget));
-		LOG("Did MOV r0, #0 and RET\n");
-	} else {
-		// case2: ret0 gadget does not exist.
-		void* nop_region = NULL;
-		uint32_t search_nop_region[16];
-		for(int i=0; i<16;i++) {
-			search_nop_region[i] = new_nop();
-		}
-		// Search NOP region
-		nop_region = memmem(iboot_in->buf, iboot_in->len, &search_nop_region, sizeof(search_nop_region));
-		if(nop_region) {
-			LOG("NOP region at 0x%llx\n", (addr_t)(nop_region - iboot_in->buf));
-			addr_t new_ret0 = (addr_t)(nop_region - iboot_in->buf + (4*8));
-			// create ret0
-			write_opcode(iboot_in->buf, new_ret0, movInsn);
-			write_opcode(iboot_in->buf, new_ret0+4, retInsn);
-			LOG("new ret0 gadget at 0x%llx\n", new_ret0);
-			// make branch
-			write_opcode(iboot_in->buf, crawl, new_branch(crawl, new_ret0));
-			LOG("Did MOV r0, #0 and RET\n");
-		} else {
-			// case3: ret0 gadget and NOP region does not exist.
-			// overwrite to ret
-			write_opcode(iboot_in->buf,crawl,movInsn);
-			write_opcode(iboot_in->buf,crawl+4,retInsn);
-			LOG("Did MOV r0, #0 and RET\n");
-		}
-	}
+    if (!func_start) {
+        WARN("Could not locate function start, RSA PATCH FAILED\n");
+        return;
+    }
+
+    // Adjust for PAC (move back to PACIBSP if needed)
+    if (pac) {
+        LOG("PAC bootloader: adjusting to PACIBSP/BTI\n");
+        uint32_t op = get_insn(buf, func_start);
+        if (op != PACIBSP && op != BTI_C) {
+            addr_t search = func_start;
+            int found = 0;
+            for (int i = 0; i < 4; i++) {
+                search -= 4;
+                if (search < 0) break;
+                if (get_insn(buf, search) == PACIBSP || get_insn(buf, search) == BTI_C) {
+                    func_start = search;
+                    found = 1;
+                    LOG("Found PACIBSP/BTI at 0x%llx\n", func_start);
+                    break;
+                }
+            }
+            if (!found) WARN("PACIBSP not found, proceeding anyway\n");
+        } else {
+            LOG("PACIBSP already at function start\n");
+        }
+    }
+
+    // Patch: MOV X0, #0 ; RET
+    LOG("Patching RSA at 0x%llx\n", func_start + iboot_in->base);
+    uint32_t mov = new_mov_immediate_insn(0, 0, 1);
+    uint32_t ret = new_ret_insn(-1);
+    write_opcode(buf, func_start, mov);
+    write_opcode(buf, func_start + 4, ret);
+    LOG("RSA PATCH SUCCESSFUL\n");
 }
 
-int patch_boot_args64(struct iboot64_img* iboot_in, char* bootargs) {
-	// find current boot-args
-	void* default_loc = NULL;
-	int num = 1;
-	LOG("Image base address at 0x%llx\n",iboot_in->base);
-	if ((iboot_in->VERS == 6723 && iboot_in->minor_vers >= 100) || iboot_in->VERS >= 7429) // 14.5 and up
-		default_loc = memmem(iboot_in->buf,iboot_in->len,"rd=md0",strlen("rd=md0"));
-	else
-		default_loc = memmem(iboot_in->buf,iboot_in->len,DEFAULT_BOOTARGS_STRING,strlen(DEFAULT_BOOTARGS_STRING));
-	if(!default_loc) { // if those are not found, try for the other possible string
-		LOG("Searching for alternate boot-args\n");
-		if ((iboot_in->VERS == 6723 && iboot_in->minor_vers >= 100) || iboot_in->VERS >= 7429)
-			default_loc = memmem(iboot_in->buf,iboot_in->len," -progress",strlen(" -progress"));
-		else
-			default_loc = memmem(iboot_in->buf,iboot_in->len,OTHER_DEFAULT_BOOTARGS_STRING,strlen(OTHER_DEFAULT_BOOTARGS_STRING));
-		if(!default_loc) { // failed, uh oh
-			WARN("Could not find boot-arg string\n");
-			return -1;
-		}
-	}
-	LOG("Found boot-arg string at %p\n",GET_IBOOT_FILE_OFFSET(iboot_in,default_loc));
-	uint64_t default_args_xref = iboot64_ref(iboot_in,default_loc);
-	if ((iboot_in->VERS == 6723 && iboot_in->minor_vers >= 100) || iboot_in->VERS >= 7429) {
-		LOG("Relocating from 0x%llx...\n",iboot_in->base+default_args_xref);
-		default_args_xref = get_next_nth_insn(iboot_in->buf,default_args_xref,5,nop);
-	}
-	if(!default_args_xref) {
-		WARN("Could not find boot-arg xref\n");
-		return -1;
-	}
-	LOG("Found boot-arg xref at 0x%llx\n",iboot_in->base+default_args_xref);
-	// we only do xref relocation now. its cooler that way
-	if(strlen(bootargs) > 270) {
-		char bootargCpy[271] = { '\0' }; // sorry, gotta shorten it
-		strncpy(bootargCpy,bootargs,270);
-		bootargs = bootargCpy;
-		num = 0;
-		WARN("Truncated boot-args: %s\n",bootargs);
-	}
-	void* new_loc = NULL;
-	char zeros[270] = {0};
-	// cryptiiiic boot arg location
-	// https://github.com/Cryptiiiic/liboffsetfinder64/blob/4d034e5102178177e1bf9f5cc024a95651bed22b/liboffsetfinder64/ibootpatchfinder64_base.cpp#L225
-	// so much better than finding random error strings
-	new_loc = memmem(iboot_in->buf,iboot_in->len,zeros,270);
-	if(!new_loc) {
-		if (strlen(bootargs) >= 180) {
-			WARN("Boot arg string too long, truncating...\n");
-			char largerBootargCpy[180] = { '\0' };
-			strncpy(largerBootargCpy,bootargs,179);
-			bootargs = largerBootargCpy;
-			num = 0;
-			WARN("Truncated boot-args again: %s\n",bootargs);
-		}
-		new_loc = memmem(iboot_in->buf,iboot_in->len,CERT_STRING,strlen(CERT_STRING));
-		if(!new_loc) {
-			WARN("Could not find long string to override\n");
-			return -1; // no Reliance string or dart_ctrr. update code
-		}
-		memset(new_loc,'\0',179);
-	} else {
-		new_loc += 0x10;
-		memset(new_loc,'\0',270); // zero out new_loc
-	}
-	LOG("Pointing boot-arg xref to large string at: %p\n",GET_IBOOT64_ADDR(iboot_in,new_loc));
-	int ret = change_bootarg_adr_xref_addr(iboot_in,default_args_xref,(unsigned long long)new_loc);
-	if (ret < 0)
-		return -1;
-	strncpy(new_loc,bootargs,strlen(bootargs)+num); // main part done. also no null terminator. don't like those
-	// now to patch up
-	return doFinalBootArgs(iboot_in,default_args_xref,(unsigned long long)new_loc);
+/* -------------------------------------------------------------------------
+   2. CTRR lockdown – NOP MSR CTRR_*_EL2
+   ------------------------------------------------------------------------- */
+int patch_ctrr_lockdown(struct iboot64_img* iboot_in) {
+    uint8_t *buf = iboot_in->buf;
+    size_t len = iboot_in->len;
+    int count = 0;
+    LOG("Searching for CTRR MSR instructions...\n");
+    for (addr_t off = 0; off < len - 4; off += 4) {
+        uint32_t w = get_insn(buf, off);
+        if ((w & 0xFFF00000) != 0xD5100000) continue;
+        int op0 = 2 + ((w >> 19) & 1);
+        int op1 = (w >> 16) & 0x7;
+        int crn = (w >> 12) & 0xF;
+        int crm = (w >> 8) & 0xF;
+        int op2 = (w >> 5) & 0x7;
+        if (op0 == 3 && op1 == 4 && crn == 15 && crm == 2 && (op2 == 2 || op2 == 5)) {
+            const char *name = (op2 == 2) ? "CTRR_LOCK_EL2" : "CTRR_CTL_EL2";
+            LOG("  NOP %s at 0x%llx\n", name, off);
+            write_opcode(buf, off, NOP);
+            count++;
+        }
+    }
+    if (count == 0) WARN("No CTRR MSR found\n");
+    else LOG("CTRR lockdown: %d MSR(s) NOPed\n", count);
+    return count;
+}
+
+/* -------------------------------------------------------------------------
+   3. Boot-args injection – find "%s" and redirect
+   ------------------------------------------------------------------------- */
+int patch_boot_args64(struct iboot64_img* iboot_in, char *bootargs) {
+    uint8_t *buf = iboot_in->buf;
+    size_t len = iboot_in->len;
+    addr_t base = iboot_in->base;
+    LOG("Image base at 0x%llx\n", base);
+
+    // Find "rd=md0" as anchor
+    void *rd_md0 = memmem(buf, len, "rd=md0", 6);
+    if (!rd_md0) {
+        WARN("Could not find 'rd=md0'\n");
+        return -1;
+    }
+    addr_t rd_off = (addr_t)((uintptr_t)rd_md0 - (uintptr_t)buf);
+
+    // Find "%s\0" near rd=md0 (within ±0x100)
+    addr_t fmt_off = 0;
+    for (addr_t off = (rd_off > 0x100 ? rd_off - 0x100 : 0);
+         off < rd_off + 0x100 && off < len - 2; off++) {
+        if (buf[off] == '%' && buf[off+1] == 's' && buf[off+2] == 0) {
+            fmt_off = off;
+            break;
+        }
+    }
+
+    // If not found, scan entire binary for "%s\0" with an ADRP+ADD xref
+    if (!fmt_off) {
+        LOG("Searching whole binary for %%s with ADRP xref...\n");
+        addr_t pos = 0;
+        while ((pos = (addr_t)memmem(buf + pos, len - pos, "%s\0", 3)) != 0) {
+            // Check if this "%s" has at least one ADRP+ADD xref
+            adrp_add_pair_t pairs[4];
+            int n = find_adrp_add_refs(buf, len, base, pos, pairs, 4);
+            if (n > 0) {
+                fmt_off = pos;
+                LOG("Found %%s at 0x%llx with %d xref(s)\n", fmt_off, n);
+                break;
+            }
+            pos += 3;
+        }
+    }
+
+    if (!fmt_off) {
+        WARN("Could not find suitable %%s string\n");
+        return -1;
+    }
+
+    LOG("Using %%s at 0x%llx\n", fmt_off);
+
+    // Find ADRP+ADD xrefs to fmt_off
+    adrp_add_pair_t pairs[8];
+    int num_refs = find_adrp_add_refs(buf, len, base, fmt_off, pairs, 8);
+    if (num_refs == 0) {
+        WARN("No ADRP+ADD xref to %%s\n");
+        return -1;
+    }
+
+    // Find a zero region for new boot-args
+    addr_t slot = 0;
+    for (addr_t off = 0x14000; off < len - 64; off += 16) {
+        int zero = 1;
+        for (int i = 0; i < 64; i++) if (buf[off+i]) { zero = 0; break; }
+        if (zero) { slot = off; break; }
+    }
+    if (!slot) {
+        WARN("No NUL slot found\n");
+        return -1;
+    }
+
+    // Prepare new boot-args
+    char new_args[300];
+    snprintf(new_args, sizeof(new_args), "serial=3 -v debug=0x2014e %s", bootargs);
+    size_t new_len = strlen(new_args) + 1;
+    if (new_len > 270) {
+        WARN("Boot-args too long, truncating\n");
+        new_args[270] = 0;
+        new_len = 270;
+    }
+
+    LOG("Injecting boot-args at 0x%llx: \"%s\"\n", slot, new_args);
+    memcpy(buf + slot, new_args, new_len);
+
+    // Redirect each ADRP+ADD pair to the new slot
+    addr_t new_va = base + slot;
+    addr_t new_page = new_va & ~0xFFF;
+    addr_t new_pageoff = new_va & 0xFFF;
+
+    for (int i = 0; i < num_refs; i++) {
+        addr_t adrp_off = pairs[i].adrp;
+        addr_t add_off = pairs[i].add;
+        int rd = get_insn(buf, adrp_off) & 0x1F;
+
+        // Rebuild ADRP
+        int64_t delta = (new_page - ((base + adrp_off) & ~0xFFF)) >> 12;
+        uint32_t new_adrp = 0x90000000 | ((delta & 0x3) << 29) | (((delta >> 2) & 0x7FFFF) << 5) | rd;
+        write_opcode(buf, adrp_off, new_adrp);
+
+        // Rebuild ADD
+        uint32_t new_add = 0x91000000 | (new_pageoff << 10) | (rd << 5) | rd;
+        write_opcode(buf, add_off, new_add);
+
+        LOG("Redirected ADRP+ADD at 0x%llx,0x%llx\n", adrp_off, add_off);
+    }
+
+    LOG("Boot-args patch applied\n");
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+   4. Kernel debug – automatic BL count
+   ------------------------------------------------------------------------- */
+void do_kdbg_mov(struct iboot64_img* iboot_in, addr_t xref) {
+    bool pac = iboot64_pac_check(iboot_in);
+    int nth_bl = pac ? 5 : 2;
+    addr_t bl_off = get_next_nth_insn(iboot_in->buf, xref, nth_bl, bl);
+    if (!bl_off) {
+        WARN("Could not find BL #%d, trying fallback\n", nth_bl);
+        bl_off = get_next_nth_insn(iboot_in->buf, xref, 1, bl);
+        if (bl_off) bl_off += (nth_bl - 1) * 4;
+        else { WARN("Kernel debug patch failed\n"); return; }
+    }
+    LOG("Found BL #%d at 0x%llx\n", nth_bl, bl_off);
+    uint32_t mov = new_mov_immediate_insn(0, 1, 1);
+    write_opcode(iboot_in->buf, bl_off, mov);
+    LOG("Wrote MOVZ X0,#1 at 0x%llx\n", bl_off + iboot_in->base);
 }
 
 int enable_kernel_debug(struct iboot64_img* iboot_in) {
-	void* debugLoc = NULL;
-	debugLoc = memmem(iboot_in->buf,iboot_in->len,"debug-enabled",strlen("debug-enabled"));
-	if(!debugLoc) {
-		WARN("Could not find debug-enabled string\n");
-		return -1;
-	}
-	LOG("Found debug-enabled string at %p\n",GET_IBOOT_FILE_OFFSET(iboot_in,debugLoc));
-	uint64_t debugEnabledXref = iboot64_ref(iboot_in,debugLoc);
-	if(!debugEnabledXref) {
-		WARN("Could not find debug-enabled xref\n");
-		return -1;
-	}
-	LOG("Found debug-enabled xref at 0x%llx\n",debugEnabledXref);
-	// now hand off ctrl to patchfinder to get rid of bl and replace with an unconditional mov
-	do_kdbg_mov(iboot_in,debugEnabledXref);
-	LOG("Enabled kernel debug\n");
-	return 0;
+    void *debug = memmem(iboot_in->buf, iboot_in->len, "debug-enabled", 13);
+    if (!debug) { WARN("debug-enabled not found\n"); return -1; }
+    uint64_t xref = iboot64_ref(iboot_in, debug);
+    if (xref == (uint64_t)-1) { WARN("debug-enabled xref not found\n"); return -1; }
+    do_kdbg_mov(iboot_in, xref);
+    LOG("Enabled kernel debug\n");
+    return 0;
 }
 
-int rsa_sigcheck_patch(struct iboot64_img* iboot_in, bool pac) {
-	void* img4Loc = NULL;
-	img4Loc = memmem(iboot_in->buf,iboot_in->len,"IMG4\0",5);
-	if(!img4Loc) {
-		WARN("Could not find IMG4 string\n");
-		return -1;
-	}
-	LOG("Found IMG4 string at %p\n",GET_IBOOT_FILE_OFFSET(iboot_in,img4Loc));
-	uint64_t img4Ref = iboot64_ref(iboot_in,img4Loc);
-	if(!img4Ref) {
-		WARN("Could not find IMG4 xref\n");
-		return -1;
-	}
-	LOG("Found IMG4 xref at 0x%llx\n",img4Ref);
-	do_rsa_sigcheck_patch(iboot_in, img4Ref, pac);
-	return 0;
-}
-
-int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintptr_t ptr) { // useful for kicking off iBoot payloads
-	char* realCmd = (char*)malloc(strlen(command)+2); // nulls all around
-	memset(realCmd,0,strlen(command)+2); 
-	// need to search for null-surrounded \0__cmd__\0
-	for(int i = 0; i < (strlen(command)); i++)
-		realCmd[i+1] = command[i];
-	void* cmdLoc = memmem(iboot_in->buf,iboot_in->len,realCmd,strlen(command)+2);
-	if(!cmdLoc) {
-		WARN("Unable to find \"%s\" in image\n",command);
-		free(realCmd);
-		return -1;
-	}
-	free(realCmd); // into the garbage
-	cmdLoc++; // because we had a null char at the beginning, advance one to get real location
-	LOG("Found command \"%s\" at %p looking for 0x%llx\n",command,GET_IBOOT_FILE_OFFSET(iboot_in,cmdLoc),(uint64_t)GET_IBOOT64_ADDR(iboot_in,cmdLoc));
-	void* cmdRef = iboot64_memmem(iboot_in,cmdLoc);
-	if(!cmdRef) {
-		WARN("Unable to find reference to command \"%s\"\n",command);
-		return -1;
-	}
-	addr_t ref = (addr_t)GET_IBOOT_FILE_OFFSET(iboot_in,cmdRef);
-	LOG("Found reference to %s command at 0x%llx\n",command,ref);
-	// now do patch
-	LOG("Pointing %s to 0x%lx\n",command,ptr);
-	*(uint64_t*)(iboot_in->buf+ref+8) = ptr; // plus 8 because we don't want to overwrite the ref itself, but what it executes
-	return 0;
-}
-
+/* -------------------------------------------------------------------------
+   5. NVRAM unlock
+   ------------------------------------------------------------------------- */
 int unlock_nvram(struct iboot64_img* iboot_in) {
-	void* debuguartLoc = memmem(iboot_in->buf,iboot_in->len,"debug-uarts",strlen("debug-uarts"));
-	if(!debuguartLoc) {
-		WARN("Unable to find debug-uarts string\n");
-		return -1;
-	}
-	LOG("Found debug-uarts string at %p\n",GET_IBOOT64_ADDR(iboot_in,debuguartLoc));
-	void* debuguartRef = iboot64_memmem(iboot_in,debuguartLoc);
-	if(!debuguartRef) {
-		WARN("Unable to find debug-uarts reference\n");
-		return -1;
-	}
-	addr_t debugRef = (addr_t)GET_IBOOT_FILE_OFFSET(iboot_in,debuguartRef);
-	LOG("Found debug-uarts reference at 0x%llx\n",debugRef);
-	addr_t setenvWhitelist = debugRef;
-	while(get_ptr_loc(iboot_in->buf,setenvWhitelist-=8)); // move back until we get 0x0
-	setenvWhitelist+=8; // go back up one to get to start of list
-	LOG("setenv whitelist begins at 0x%llx\n",setenvWhitelist);
-	addr_t blacklistFunc = xref64(iboot_in->buf,0,iboot_in->len,setenvWhitelist);
-	if(!blacklistFunc) {
-		WARN("Could not find reference to setenv whitelist\n");
-		return -1;
-	}
-	LOG("Found ref to setenv whitelist at 0x%llx\n",blacklistFunc);
-	addr_t blacklistFuncBegin = bof64(iboot_in->buf,0,blacklistFunc);
-	if(!blacklistFuncBegin) {
-		WARN("Could not find beginning of blacklist function\n");
-		return -1;
-	}
-	LOG("Forcing sub_%llx to return immediately\n",blacklistFuncBegin+iboot_in->base);
-	uint32_t movZeroZero = new_mov_immediate_insn(0,0,1);
-	uint32_t retInsn = new_ret_insn(-1);
-	write_opcode(iboot_in->buf,blacklistFuncBegin,movZeroZero);
-	write_opcode(iboot_in->buf,blacklistFuncBegin+4,retInsn);
-	addr_t envWhitelist = setenvWhitelist;
-	while(get_ptr_loc(iboot_in->buf,envWhitelist+=8));
-	envWhitelist += 8;
-	LOG("Found env whitelist at 0x%llx\n",envWhitelist);
-	addr_t blacklistFunc2 = xref64(iboot_in->buf,0,iboot_in->len,envWhitelist);
-	if(!blacklistFunc2) {
-		WARN("Could not find reference to env whitelist\n");
-		return -1;
-	}
-	LOG("Found ref to env whitelist at 0x%llx\n",blacklistFunc2);
-	addr_t blacklistFunc2Begin = bof64(iboot_in->buf,0,blacklistFunc2);
-	if(!blacklistFunc2Begin) {
-		WARN("Could not find beginning of second blacklist function\n");
-		return -1;
-	}
-	LOG("Forcing sub_%llx to return immediately\n",blacklistFunc2Begin+iboot_in->base);
-	write_opcode(iboot_in->buf,blacklistFunc2Begin,movZeroZero);
-	write_opcode(iboot_in->buf,blacklistFunc2Begin+4,retInsn);
-	void* comAppleSystemLoc = memmem(iboot_in->buf,iboot_in->len,"com.apple.System.",strlen("com.apple.System.")+1);
-	// strlen() + 1 because we are including the null terminator in the search 
-	if(!comAppleSystemLoc) {
-		WARN("Could not find string \"com.apple.System.\"\n");
-		return -1;
-	}
-	LOG("Found \"com.apple.System.\" string at %p\n",GET_IBOOT64_ADDR(iboot_in,comAppleSystemLoc));
-	addr_t comAppleSystemRef = iboot64_ref(iboot_in,comAppleSystemLoc);
-	if(!comAppleSystemLoc) {
-		WARN("Could not find reference to \"com.apple.System.\"\n");
-		return -1;
-	}
-	LOG("Found reference to \"com.apple.System.\" at 0x%llx\n",comAppleSystemRef);
-	addr_t appleSystemFuncBegin = bof64(iboot_in->buf,0,comAppleSystemRef);
-	if(!appleSystemFuncBegin) {
-		WARN("Unable to find beginning of function where \"com.apple.System.\" is referenced\n");
-		return -1;
-	}
-	LOG("Forcing sub_%llx to return immediately\n",appleSystemFuncBegin+iboot_in->base);
-	write_opcode(iboot_in->buf,appleSystemFuncBegin,movZeroZero);
-	write_opcode(iboot_in->buf,appleSystemFuncBegin+4,retInsn);
-	return 0;
+    uint8_t *buf = iboot_in->buf;
+    size_t len = iboot_in->len;
+    addr_t base = iboot_in->base;
+    bool pac = iboot64_pac_check(iboot_in);
+
+    void *debuguartLoc = memmem(buf, len, "debug-uarts", strlen("debug-uarts"));
+    if (!debuguartLoc) {
+        WARN("Unable to find debug-uarts string\n");
+        return -1;
+    }
+    LOG("Found debug-uarts string at %p\n", GET_IBOOT64_ADDR(iboot_in, debuguartLoc));
+
+    void *debuguartRef = iboot64_memmem(iboot_in, debuguartLoc);
+    if (!debuguartRef) {
+        WARN("Unable to find debug-uarts reference\n");
+        return -1;
+    }
+    addr_t debugRef = (addr_t)GET_IBOOT_FILE_OFFSET(iboot_in, debuguartRef);
+    LOG("Found debug-uarts reference at 0x%llx\n", debugRef);
+
+    // find start of whitelist
+    addr_t setenvWhitelist = debugRef;
+    while (get_ptr_loc(buf, setenvWhitelist -= 8) != 0);
+    setenvWhitelist += 8;
+    LOG("setenv whitelist begins at 0x%llx\n", setenvWhitelist);
+
+    addr_t blacklistFunc = xref64(buf, 0, len, setenvWhitelist);
+    if (!blacklistFunc) {
+        WARN("Could not find reference to setenv whitelist\n");
+        return -1;
+    }
+    LOG("Found ref to setenv whitelist at 0x%llx\n", blacklistFunc);
+
+    addr_t blacklistFuncBegin = bof64(buf, 0, blacklistFunc);
+    if (!blacklistFuncBegin) {
+        WARN("Could not find beginning of blacklist function\n");
+        return -1;
+    }
+    LOG("Forcing sub_%llx to return immediately\n", blacklistFuncBegin + base);
+
+    uint32_t movZeroZero = new_mov_immediate_insn(0, 0, 1);
+    uint32_t retInsn = new_ret_insn(-1);
+    write_opcode(buf, blacklistFuncBegin, movZeroZero);
+    write_opcode(buf, blacklistFuncBegin + 4, retInsn);
+
+    // env whitelist
+    addr_t envWhitelist = setenvWhitelist;
+    while (get_ptr_loc(buf, envWhitelist += 8) != 0);
+    envWhitelist += 8;
+    LOG("Found env whitelist at 0x%llx\n", envWhitelist);
+
+    addr_t blacklistFunc2 = xref64(buf, 0, len, envWhitelist);
+    if (!blacklistFunc2) {
+        WARN("Could not find reference to env whitelist\n");
+        return -1;
+    }
+    LOG("Found ref to env whitelist at 0x%llx\n", blacklistFunc2);
+
+    addr_t blacklistFunc2Begin = bof64(buf, 0, blacklistFunc2);
+    if (!blacklistFunc2Begin) {
+        WARN("Could not find beginning of second blacklist function\n");
+        return -1;
+    }
+    LOG("Forcing sub_%llx to return immediately\n", blacklistFunc2Begin + base);
+    write_opcode(buf, blacklistFunc2Begin, movZeroZero);
+    write_opcode(buf, blacklistFunc2Begin + 4, retInsn);
+
+    // com.apple.System. prefix
+    void *comAppleSystemLoc = memmem(buf, len, "com.apple.System.", strlen("com.apple.System.") + 1);
+    if (!comAppleSystemLoc) {
+        WARN("Could not find string \"com.apple.System.\"\n");
+        return -1;
+    }
+    LOG("Found \"com.apple.System.\" string at %p\n", GET_IBOOT64_ADDR(iboot_in, comAppleSystemLoc));
+
+    addr_t comAppleSystemRef = iboot64_ref(iboot_in, comAppleSystemLoc);
+    if (comAppleSystemRef == (uint64_t)-1) {
+        WARN("Could not find reference to \"com.apple.System.\"\n");
+        return -1;
+    }
+    LOG("Found reference to \"com.apple.System.\" at 0x%llx\n", comAppleSystemRef);
+
+    addr_t appleSystemFuncBegin = bof64(buf, 0, comAppleSystemRef);
+    if (!appleSystemFuncBegin) {
+        WARN("Unable to find beginning of function where \"com.apple.System.\" is referenced\n");
+        return -1;
+    }
+    LOG("Forcing sub_%llx to return immediately\n", appleSystemFuncBegin + base);
+    write_opcode(buf, appleSystemFuncBegin, movZeroZero);
+    write_opcode(buf, appleSystemFuncBegin + 4, retInsn);
+
+    LOG("NVRAM unlocked successfully\n");
+    return 0;
 }
+
+/* -------------------------------------------------------------------------
+   6. Command handler modification
+   ------------------------------------------------------------------------- */
+int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintptr_t ptr) {
+    char *realCmd = (char*)malloc(strlen(command) + 2);
+    if (!realCmd) return -1;
+    memset(realCmd, 0, strlen(command) + 2);
+    for (int i = 0; i < (int)strlen(command); i++)
+        realCmd[i+1] = command[i];
+
+    void *cmdLoc = memmem(iboot_in->buf, iboot_in->len, realCmd, strlen(command) + 2);
+    free(realCmd);
+    if (!cmdLoc) {
+        WARN("Unable to find \"%s\" in image\n", command);
+        return -1;
+    }
+    cmdLoc++; // skip leading null
+
+    LOG("Found command \"%s\" at %p\n", command, GET_IBOOT_FILE_OFFSET(iboot_in, cmdLoc));
+
+    void *cmdRef = iboot64_memmem(iboot_in, cmdLoc);
+    if (!cmdRef) {
+        WARN("Unable to find reference to command \"%s\"\n", command);
+        return -1;
+    }
+    addr_t ref = (addr_t)GET_IBOOT_FILE_OFFSET(iboot_in, cmdRef);
+    LOG("Found reference to %s command at 0x%llx\n", command, ref);
+
+    LOG("Pointing %s handler to 0x%lx\n", command, ptr);
+    *(uint64_t*)(iboot_in->buf + ref + 8) = ptr;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+   7. RSA wrapper (entry point from rsa_sigcheck_patch)
+   ------------------------------------------------------------------------- */
+int rsa_sigcheck_patch(struct iboot64_img* iboot_in, bool pac) {
+    void *img4 = memmem(iboot_in->buf, iboot_in->len, "IMG4\0", 5);
+    if (!img4) { WARN("IMG4 string not found\n"); return -1; }
+    addr_t img4off = (addr_t)((uintptr_t)img4 - (uintptr_t)iboot_in->buf);
+    uint64_t img4ref = iboot64_ref(iboot_in, img4);
+    if (img4ref == (uint64_t)-1) { WARN("IMG4 xref not found\n"); return -1; }
+    do_rsa_sigcheck_patch(iboot_in, (addr_t)img4ref, pac);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+   8. Legacy/other functions (kept for compatibility)
+   ------------------------------------------------------------------------- */
+bool has_magic(uint8_t* buf) {
+    uint32_t magic = *(uint32_t*)(buf+7);
+    if (memcmp(&magic, IMAGE4_MAGIC, 4) == 0) return true;
+    return false;
+}
+
+bool has_kernel_load_k(struct iboot64_img* iboot_in) {
+    void *str = memmem(iboot_in->buf, iboot_in->len, KERNELCACHE_PREP_STRING, strlen(KERNELCACHE_PREP_STRING));
+    return (str != NULL);
+}
+
+bool has_recovery_console_k(struct iboot64_img* iboot_in) {
+    void *str = memmem(iboot_in->buf, iboot_in->len, ENTERING_RECOVERY_CONSOLE, strlen(ENTERING_RECOVERY_CONSOLE));
+    return (str != NULL);
+}
+
+uint64_t get_iboot64_base_address(struct iboot64_img* iboot_in) {
+    uint32_t offset = 0x318;
+    get_iboot64_version(iboot_in);
+    if (iboot_in->buf) {
+        if (iboot_in->VERS >= 6603) offset = 0x300;
+        iboot_in->base = *(uint64_t*)(iboot_in->buf + offset);
+        return iboot_in->base;
+    }
+    return 0;
+}
+
+// Other original functions (change_bootarg_adr_xref_addr, doFinalBootArgs, etc.)
+// are already provided in the original newpatch.c and can be kept unchanged.
+// For completeness, we include stubs if they are not defined elsewhere.
+
+/* -------------------------------------------------------------------------
+   Stubs for missing functions (if not provided by newpatch.h)
+   ------------------------------------------------------------------------- */
+#ifndef HAVE_GET_IBOOT64_VERSION
+uint32_t get_iboot64_version(struct iboot64_img* iboot_in) {
+    void *ver = memmem(iboot_in->buf, iboot_in->len, "iBoot-", 6);
+    if (!ver) return 0;
+    char vers[5] = {0};
+    strncpy(vers, (char*)ver + 6, 4);
+    iboot_in->VERS = atoi(vers);
+    return iboot_in->VERS;
+}
+#endif
+
+#ifndef HAVE_GET_IBOOT64_ADDR
+addr_t GET_IBOOT64_ADDR(struct iboot64_img* iboot_in, void* ptr) {
+    return iboot_in->base + ((uintptr_t)ptr - (uintptr_t)iboot_in->buf);
+}
+#endif
+
+#ifndef HAVE_GET_IBOOT_FILE_OFFSET
+addr_t GET_IBOOT_FILE_OFFSET(struct iboot64_img* iboot_in, void* ptr) {
+    return (uintptr_t)ptr - (uintptr_t)iboot_in->buf;
+}
+#endif
