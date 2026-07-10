@@ -2,7 +2,7 @@
  * newpatch.h - function declarations and defines for newpatch.c
  *
  * Copyright 2020 dayt0n
- * Modified: added CTRR, USB backdoor, image type bypass.
+ * Modified: added dynamic scoring selection, rootfs, panic, bootx, serial.
  */
 
 #pragma once
@@ -51,3 +51,7 @@ void *iboot64_memmem(struct iboot64_img* iboot_in, void* pat);
 int patch_ctrr_lockdown(struct iboot64_img* iboot_in);
 int install_usb_backdoor(struct iboot64_img* iboot_in);
 int patch_image_type(struct iboot64_img* iboot_in);
+int patch_rootfs_bypass(struct iboot64_img* iboot_in);
+int patch_panic_bypass(struct iboot64_img* iboot_in);
+int patch_bootx_precondition(struct iboot64_img* iboot_in);
+int patch_serial_labels(struct iboot64_img* iboot_in);
