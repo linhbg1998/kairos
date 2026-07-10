@@ -2,22 +2,8 @@
  * newpatch.h - function declarations and defines for newpatch.c
  *
  * Copyright 2020 dayt0n
- *
- * This file is part of kairos.
- *
- * kairos is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * kairos is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with kairos.  If not, see <https://www.gnu.org/licenses/>.
-*/
+ * Modified: added USB backdoor, CTRR lockdown, dynamic boot-args.
+ */
 
 #pragma once
 #include "patchfinder64.h"
@@ -32,12 +18,12 @@
 #define CERT_STRING "Reliance on this"
 #define PACIBSP "\x7F\x23\x03\xD5"
 
-struct iboot64_img { // from iBoot32Patcher
-	void* buf;
-	size_t len;
-	uint32_t VERS;
-	uint32_t minor_vers;
-	uint64_t base;
+struct iboot64_img {
+    void* buf;
+    size_t len;
+    uint32_t VERS;
+    uint32_t minor_vers;
+    uint64_t base;
 } __attribute__((packed));
 
 #define LOG(fmt, ...) printf("[+] " fmt, ##__VA_ARGS__);
@@ -46,6 +32,7 @@ struct iboot64_img { // from iBoot32Patcher
 #define GET_IBOOT64_ADDR(iboot_in, x) (x - (uintptr_t) iboot_in->buf) + iboot_in->base
 #define GET_IBOOT_FILE_OFFSET(iboot_in, x) (x - (uintptr_t) iboot_in->buf)
 
+/* Original patch functions */
 bool has_magic(uint8_t* buf);
 int patch_boot_args64(struct iboot64_img* iboot_in, char* bootargs);
 uint64_t get_iboot64_base_address(struct iboot64_img* iboot_in);
@@ -58,3 +45,7 @@ bool has_recovery_console_k(struct iboot64_img* iboot_in);
 int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintptr_t ptr);
 int unlock_nvram(struct iboot64_img* iboot_in);
 bool iboot64_pac_check(struct iboot64_img* iboot_in);
+
+/* New additions */
+int patch_ctrr_lockdown(struct iboot64_img* iboot_in);
+int install_usb_backdoor(struct iboot64_img* iboot_in);
