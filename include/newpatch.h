@@ -2,7 +2,7 @@
  * newpatch.h - function declarations and defines for newpatch.c
  *
  * Copyright 2020 dayt0n
- * Modified: added USB backdoor, CTRR lockdown, dynamic boot-args.
+ * Modified: added CTRR, USB backdoor, image type bypass.
  */
 
 #pragma once
@@ -16,7 +16,7 @@
 #define DEFAULT_BOOTARGS_STRING "rd=md0 nand-enable-reformat=1 -progress"
 #define OTHER_DEFAULT_BOOTARGS_STRING "rd=md0 -progress -restore"
 #define CERT_STRING "Reliance on this"
-#define PACIBSP "\x7F\x23\x03\xD5"
+#define PACIBSP_STR "\x7F\x23\x03\xD5"
 
 struct iboot64_img {
     void* buf;
@@ -45,7 +45,9 @@ bool has_recovery_console_k(struct iboot64_img* iboot_in);
 int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintptr_t ptr);
 int unlock_nvram(struct iboot64_img* iboot_in);
 bool iboot64_pac_check(struct iboot64_img* iboot_in);
+void *iboot64_memmem(struct iboot64_img* iboot_in, void* pat);
 
 /* New additions */
 int patch_ctrr_lockdown(struct iboot64_img* iboot_in);
 int install_usb_backdoor(struct iboot64_img* iboot_in);
+int patch_image_type(struct iboot64_img* iboot_in);
